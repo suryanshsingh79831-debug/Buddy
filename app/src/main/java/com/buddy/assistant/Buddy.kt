@@ -470,4 +470,135 @@ object Commands {
             }
             if (c.timeInMillis <= System.currentTimeMillis()) c.add(Calendar.DAY_OF_YEAR, 1)
             at = c.timeInMillis
-            spoken = "at " + SimpleDateFormat("h:mm
+            
+            spoken = "at " + SimpleDateFormat("h:mm a", Locale.getDefault()).format(c.time)
+        } else {
+            return "Tell me a time, like: remind me to drink water at 8 pm every day"
+        }
+
+        var task = t0.replace(Regex("^remind( me)?"), "")
+            .replace(atRe, "").replace(inRe, "").replace(dailyRe, "")
+            .replace(Regex("\\s+"), " ").trim()
+        if (task.startsWith("to ")) task = task.removePrefix("to ").trim()
+        if (task.isEmpty()) task = "Your reminder"
+
+        Reminders.add(ctx, at, daily && rel == null, task)
+        return "Okay. I will remind you to $task $spoken" + if (daily && rel == null) ", every day" else ""
+    }
+
+    private fun torch(ctx: Context, on: Boolean): String {
+        val cm = ctx.getSystemService(CameraManager::class.java)
+        val id = cm.cameraIdList.firstOrNull {
+            cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        } ?: return "This phone has no flashlight"
+        cm.setTorchMode(id, on)
+        return if (on) "Flashlight on" else "Flashlight off"
+    }
+}
+
+data class Rem(val id: Int, var at: Long, val daily: Boolean, val text: String)
+
+object Reminders {
+    private const val DAY = 24L * 60 * 60 * 1000
+    private const val CHANNEL = "buddy_reminders"
+
+    private fun load(c: Context): MutableList<Rem> {
+        val raw = c.getSharedPreferences("reminders", Context.MODE_PRIVATE).getString("items", "") ?: ""
+        return raw.lines().filter { it.isNotBlank() }.mapNotNull {
+            val p = it.split(";", limit = 4)
+            if (p.size < 4) null else Rem(p[0].toInt(), p[1].toLong(), p[2] == "1", p[3])
+        }.toMutableList()
+    }
+
+    private fun save(c: Context, list: List<Rem>) {
+        val raw = list.joinToString("\n") {
+            "${it.id};${it.at};${if (it.daily) 1 else 0};${it.text.replace(";", ",").replace("\n", " ")}"
+        }
+        c.getSharedPreferences("reminders", Context.MODE_PRIVATE).edit().putString("items", raw).apply()
+    }
+
+    private fun pending(c: Context, id: Int): PendingIntent =
+        PendingIntent.getBroadcast(
+            c, id,
+            Intent(c, ReminderReceiver::class.java).putExtra("id", id),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+    private fun schedule(c: Context, r: Rem) {
+        val am = c.getSystemService(AlarmManager::class.java)
+        val exactOk = Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()
+        if (exactOk) am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, r.at, pending(c, r.id))
+        else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, r.at, pending(c, r.id))
+    }
+
+    fun add(c: Context, at: Long, daily: Boolean, text: String) {
+        val list = load(c)
+        val r = Rem((System.currentTimeMillis() / 1000 % 1_000_000_000).toInt(), at, daily, text)
+        list.add(r)
+        save(c, list)
+        schedule(c, r)
+    }
+
+    fun count(c: Context): Int = load(c).size
+
+    fun clearAll(c: Context) {
+        val am = c.getSystemService(AlarmManager::class.java)
+        load(c).forEach { am.cancel(pending(c, it.id)) }
+        save(c, emptyList())
+    }
+
+    fun rescheduleAll(c: Context) {
+        val now = System.currentTimeMillis()
+        val keep = mutableListOf<Rem>()
+        for (r in load(c)) {
+            if (r.at <= now) {
+                if (!r.daily) continue
+                while (r.at <= now) r.at += DAY
+            }
+            keep.add(r)
+            schedule(c, r)
+        }
+        save(c, keep)
+    }
+
+    fun fire(c: Context, id: Int) {
+        val list = load(c)
+        val r = list.find { it.id == id } ?: return
+        notify(c, r.text)
+        if (r.daily) {
+            val now = System.currentTimeMillis()
+            while (r.at <= now) r.at += DAY
+            save(c, list)
+            schedule(c, r)
+        } else {
+            list.remove(r)
+            save(c, list)
+        }
+    }
+
+    private fun notify(c: Context, text: String) {
+        val nm = c.getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL, "Reminders", NotificationManager.IMPORTANCE_HIGH)
+        )
+        val n = Notification.Builder(c, CHANNEL)
+            .setSmallIcon(android.R.drawable.ic_popup_reminder)
+            .setContentTitle("Reminder")
+            .setContentText(text)
+            .setAutoCancel(true)
+            .build()
+        nm.notify((System.currentTimeMillis() % 100000).toInt(), n)
+    }
+}
+
+class ReminderReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        Reminders.fire(context, intent.getIntExtra("id", -1))
+    }
+}
+
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == Intent.ACTION_BOOT_COMPLETED) Reminders.rescheduleAll(context)
+    }
+}
